@@ -68,7 +68,7 @@
  *        Executable: <path>
  */
 
-import { readFileSync, existsSync, readdirSync, writeFileSync, appendFileSync, renameSync, statSync } from 'node:fs';
+import { readFileSync, existsSync, readdirSync, writeFileSync, appendFileSync, renameSync, statSync, createReadStream } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { join, basename, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -81,7 +81,7 @@ import { createInterface } from 'node:readline';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 const FORMAT = 'starloot-sync/1';
-const COMPANION_VERSION = '0.1.1';
+const COMPANION_VERSION = '0.1.2';
 
 // ---------------------------------------------------------------------------
 // Crash diagnostics
@@ -635,30 +635,58 @@ function displayNameFor(cls, nameMap) {
 // File discovery / reading
 // ---------------------------------------------------------------------------
 
-// Memory safety: the parser uses readFileSync (whole file in memory at once).
-// Normal Game.log files are well under 10MB; refuse anything pathological.
-const MAX_LOG_FILE_BYTES = 200 * 1024 * 1024; // 200MB
+// Memory safety: files are streamed line-by-line (node:readline over a
+// fs.createReadStream), so per-file memory is O(one line), not O(file size) —
+// large Game.log/logbackups files no longer risk exhausting the default V8
+// heap the way a whole-file readFileSync + split-into-array would. This soft
+// threshold is now just a heads-up for absurdly large files; it never skips a
+// file silently, it only prints why it's taking a while.
+const HUGE_LOG_FILE_WARN_BYTES = 500 * 1024 * 1024; // 500MB
 
-function readLogFile(path) {
+/**
+ * Stream a log file line-by-line via node:readline over a read stream,
+ * calling `onLine(line)` for each line in order. Memory usage is bounded by
+ * a single line's length, not the file's total size — safe for logbackups
+ * files of any realistic size.
+ */
+async function streamLines(path, onLine) {
 	const size = statSync(path).size;
-	if (size > MAX_LOG_FILE_BYTES) {
-		console.warn(`WARNING: skipping ${path} — ${(size / 1024 / 1024).toFixed(0)}MB exceeds the ${MAX_LOG_FILE_BYTES / 1024 / 1024}MB safety limit for a single log file.`);
-		return [];
+	if (size > HUGE_LOG_FILE_WARN_BYTES) {
+		console.warn(`NOTE: ${path} is ${(size / 1024 / 1024).toFixed(0)}MB — this may take a little while. It is streamed line-by-line, so this is only a speed heads-up, not a memory concern.`);
 	}
-	const text = readFileSync(path, 'utf8');
-	return text.split(/\r?\n/);
+	const stream = createReadStream(path, 'utf8');
+	const rl = createInterface({ input: stream, crlfDelay: Infinity });
+	try {
+		for await (const line of rl) {
+			onLine(line);
+		}
+	} finally {
+		rl.close();
+		stream.destroy();
+	}
 }
 
-/** First ISO-8601 timestamp found in a log file's opening lines, or null. */
-function firstTimestampIn(path) {
-	if (statSync(path).size > MAX_LOG_FILE_BYTES) return null;
-	const text = readFileSync(path, 'utf8');
-	const lines = text.split(/\r?\n/, 50);
-	for (const line of lines) {
-		const m = /^<(\d{4}-\d{2}-\d{2}T[^>]+)>/.exec(line);
-		if (m) return m[1];
+/** First ISO-8601 timestamp found in a log file's opening lines, or null. Streams and bails after the first match (or after a bounded number of lines). */
+async function firstTimestampIn(path) {
+	let result = null;
+	let linesSeen = 0;
+	const stream = createReadStream(path, 'utf8');
+	const rl = createInterface({ input: stream, crlfDelay: Infinity });
+	try {
+		for await (const line of rl) {
+			linesSeen++;
+			const m = /^<(\d{4}-\d{2}-\d{2}T[^>]+)>/.exec(line);
+			if (m) {
+				result = m[1];
+				break;
+			}
+			if (linesSeen >= 50) break;
+		}
+	} finally {
+		rl.close();
+		stream.destroy();
 	}
-	return null;
+	return result;
 }
 
 /**
@@ -668,14 +696,20 @@ function firstTimestampIn(path) {
  * Since quantity deltas clamp at zero, processing out of order can corrupt
  * net state, so correct chronological ordering matters here.
  */
-function findBackupLogs(dir) {
+async function findBackupLogs(dir) {
 	if (!dir || !existsSync(dir)) return [];
-	return readdirSync(dir)
+	const candidates = readdirSync(dir)
 		.filter((f) => /^Game.*\.log$/i.test(f))
-		.map((f) => join(dir, f))
-		.map((p) => ({ path: p, ts: firstTimestampIn(p) ?? '' }))
-		.sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0))
-		.map((e) => e.path);
+		.map((f) => join(dir, f));
+	// Peeking each file's first timestamp is also streaming (see
+	// firstTimestampIn) — files are still processed strictly sequentially so
+	// backup ordering (oldest-first) stays deterministic.
+	const entries = [];
+	for (const p of candidates) {
+		entries.push({ path: p, ts: (await firstTimestampIn(p)) ?? '' });
+	}
+	entries.sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0));
+	return entries.map((e) => e.path);
 }
 
 /**
@@ -730,37 +764,46 @@ function writeSyncFileSafely(requestedPath, sync) {
 // Main pipeline
 // ---------------------------------------------------------------------------
 
-function parseFiles(filePaths, sinceIso) {
+/**
+ * Parse a set of log files into a flat, timestamp-sorted event list. Each
+ * file is streamed line-by-line (never loaded whole into memory) and files
+ * are processed strictly sequentially, in the order given — backup ordering
+ * (oldest-first) is semantic, so we must not parallelize across files.
+ */
+async function parseFiles(filePaths, sinceIso) {
 	const events = [];
 	const sessionsSeen = [];
 	const since = sinceIso ? new Date(sinceIso).toISOString() : null;
 
 	for (const filePath of filePaths) {
 		verboseLog(`[verbose] Parsing file: ${filePath}`);
-		const lines = readLogFile(filePath);
 		let sawSessionStart = false;
+		let lineCount = 0;
 		const eventsBefore = events.length;
 		// per-category event counts for this file, for --verbose progress output
 		const categoryCounts = {};
-		for (const line of lines) {
+
+		await streamLines(filePath, (line) => {
+			lineCount++;
 			const ev = parseLine(line);
-			if (!ev) continue;
-			if (since && ev.timestamp < since) continue;
+			if (!ev) return;
+			if (since && ev.timestamp < since) return;
 			if (ev.type === 'sessionStart') {
 				sessionsSeen.push({ start: ev.timestamp, file: basename(filePath) });
 				sawSessionStart = true;
-				continue;
+				return;
 			}
 			categoryCounts[ev.type] = (categoryCounts[ev.type] ?? 0) + 1;
 			events.push(ev);
-		}
+		});
+
 		if (!sawSessionStart && events.length) {
 			// No explicit header found (e.g. a fixture snippet) — still record the file.
 			sessionsSeen.push({ start: events[0]?.timestamp ?? null, file: basename(filePath) });
 		}
 		if (verboseEnabled) {
 			const eventsParsed = events.length - eventsBefore;
-			verboseLog(`[verbose]   lines: ${lines.length}, events: ${eventsParsed}`);
+			verboseLog(`[verbose]   lines: ${lineCount}, events: ${eventsParsed}`);
 			const categorySummary = Object.entries(categoryCounts)
 				.map(([type, count]) => `${type}=${count}`)
 				.join(', ');
@@ -772,15 +815,15 @@ function parseFiles(filePaths, sinceIso) {
 	return { events, sessions: sessionsSeen };
 }
 
-function buildSyncFile({ log, backups, ini, since }) {
+async function buildSyncFile({ log, backups, ini, since }) {
 	const filePaths = [];
-	if (backups) filePaths.push(...findBackupLogs(backups));
+	if (backups) filePaths.push(...(await findBackupLogs(backups)));
 	if (log) filePaths.push(log);
 	if (filePaths.length === 0) {
 		throw new Error('No log files to parse — pass --log <path> and/or --backups <dir>.');
 	}
 
-	const { events, sessions } = parseFiles(filePaths, since);
+	const { events, sessions } = await parseFiles(filePaths, since);
 	const ledger = reduceLedger(events);
 	const nameMap = loadDisplayNames(ini);
 
@@ -811,14 +854,14 @@ function buildSyncFile({ log, backups, ini, since }) {
 // Self-test
 // ---------------------------------------------------------------------------
 
-function runSelfTest() {
+async function runSelfTest() {
 	const fixturePath = join(__dirname, 'fixtures', 'sample-lines.log');
 	if (!existsSync(fixturePath)) {
 		console.error(`Self-test fixture not found: ${fixturePath}`);
 		process.exit(1);
 	}
 
-	const { events } = parseFiles([fixturePath], null);
+	const { events } = await parseFiles([fixturePath], null);
 	const ledger = reduceLedger(events);
 
 	const failures = [];
@@ -898,7 +941,7 @@ async function runInteractiveMode() {
 		if (ini) console.log(`Found global.ini (for nicer item names): ${ini}`);
 
 		console.log('\nReading log...');
-		const sync = buildSyncFile({ log, backups, ini, out: 'starloot-sync.json' });
+		const sync = await buildSyncFile({ log, backups, ini, out: 'starloot-sync.json' });
 		const writtenPath = writeSyncFileSafely('starloot-sync.json', sync);
 
 		console.log(`\nWrote ${writtenPath} in ${process.cwd()}`);
@@ -919,7 +962,7 @@ async function runInteractiveMode() {
 	}
 }
 
-function runFlagDrivenMode(args) {
+async function runFlagDrivenMode(args) {
 	if (!args.log && !args.backups) {
 		console.error('ERROR: --log <path> (and/or --backups <dir>) is required.\n');
 		printHelp();
@@ -930,7 +973,7 @@ function runFlagDrivenMode(args) {
 		process.exit(1);
 	}
 
-	const sync = buildSyncFile(args);
+	const sync = await buildSyncFile(args);
 	const writtenPath = writeSyncFileSafely(args.out, sync);
 
 	console.log(`Wrote ${writtenPath}`);
@@ -959,7 +1002,7 @@ async function main() {
 	}
 
 	if (args.selfTest) {
-		runSelfTest();
+		await runSelfTest();
 		return;
 	}
 
@@ -969,7 +1012,7 @@ async function main() {
 	}
 
 	if (verboseEnabled) console.log(`StarLoot Companion v${COMPANION_VERSION}`);
-	runFlagDrivenMode(args);
+	await runFlagDrivenMode(args);
 }
 
 main();

@@ -138,6 +138,16 @@ honest and checkable:
   exe by name (or drag it into the terminal window and press Enter).
 - **Try `--verbose`** for more detail while it runs (per-file line/event
   counts) — the same detail is included in the error log if it then crashes.
+- **A `FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap
+  out of memory` crash, with no `starloot-companion-error.log` written:**
+  this is a V8 heap-exhaustion crash, and it happens *below* JavaScript —
+  it aborts the process before our crash logger (which is itself JS) ever
+  gets a chance to run, so there is no diagnostic block to check for this
+  one. As of **v0.1.2**, every log file (including huge `logbackups` files)
+  is streamed line-by-line instead of being read whole into memory, so this
+  specific class of crash is fixed — memory use no longer scales with file
+  size. If you still hit this on v0.1.2 or later, please report it; it would
+  indicate a genuinely new cause, not the original one.
 
 ## Requirements
 
@@ -251,7 +261,7 @@ underscores, title-casing, and dropping trailing numeric/size tokens).
 ```json
 {
   "format": "starloot-sync/1",
-  "companionVersion": "0.1.1",
+  "companionVersion": "0.1.2",
   "generatedAt": "2026-08-06T09:00:00.000Z",
   "player": "Morrschyvens",
   "gameVersion": "4.9.188.23497",
