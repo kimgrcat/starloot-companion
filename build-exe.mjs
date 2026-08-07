@@ -21,10 +21,12 @@
  *   1. Read starloot-companion.mjs.
  *   2. Verify it only imports `node:*` builtins (fail loudly otherwise — a
  *      real npm dependency would need bundling, which this script doesn't do).
- *   3. Verify it contains exactly one `writeFileSync(` call site — our
- *      read-only-except-one-output-file invariant (see companion/README.md
+ *   3. Verify it contains exactly the known write surface: exactly one
+ *      `writeFileSync(` call site (the sync-file output) and exactly one
+ *      `appendFileSync(` call site (the crash-diagnostics log) — our
+ *      read-only-except-known-writes invariant (see companion/README.md
  *      SAFETY section). This is a cheap static grep-based guard, not a proof,
- *      but it catches an accidental second write path at build time.
+ *      but it catches an accidental extra write path at build time.
  *   4. Rewrite the small number of ESM constructs it actually uses:
  *        - `import { a, b } from 'node:x'`      -> `const { a, b } = require('node:x')`
  *        - `dirname(fileURLToPath(import.meta.url))` -> `__dirname` (CJS provides this natively)
@@ -76,14 +78,20 @@ function main() {
 		}
 	}
 
-	// --- Step 3: exactly one writeFileSync call site ----------------------------
-	// Read-only discipline invariant: the ONLY write in the whole program is the
-	// single sync-file output (via writeSyncFileSafely's temp-then-rename). If a
-	// future change adds a second write path, this should be a deliberate,
-	// reviewed decision — not something that slips in silently.
+	// --- Step 3: exactly the known write surface --------------------------------
+	// Read-only discipline invariant: the ONLY writes in the whole program are
+	// the single sync-file output (via writeSyncFileSafely's temp-then-rename,
+	// one writeFileSync( call site) and the crash-diagnostics log (via
+	// appendErrorLog, one appendFileSync( call site — only ever touched if the
+	// script crashes). If a future change adds another write path, this should
+	// be a deliberate, reviewed decision — not something that slips in silently.
 	const writeFileSyncCallCount = (src.match(/\bwriteFileSync\(/g) ?? []).length;
 	if (writeFileSyncCallCount !== 1) {
 		fail(`expected exactly 1 writeFileSync( call site in starloot-companion.mjs (found ${writeFileSyncCallCount}) — read-only discipline invariant violated. See README.md SAFETY section.`);
+	}
+	const appendFileSyncCallCount = (src.match(/\bappendFileSync\(/g) ?? []).length;
+	if (appendFileSyncCallCount !== 1) {
+		fail(`expected exactly 1 appendFileSync( call site in starloot-companion.mjs (found ${appendFileSyncCallCount}) — read-only discipline invariant violated (crash log write surface changed). See README.md SAFETY section.`);
 	}
 
 	// --- Step 4: ESM -> CJS rewrite ---------------------------------------------

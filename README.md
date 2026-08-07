@@ -46,8 +46,10 @@ never on a developer machine — from the tagged source you can read here.
 - Runs as a normal user — no admin/elevated privileges requested or required.
 - Reads `Game.log` and `global.ini` **read-only**. It never modifies, moves,
   or deletes anything belonging to Star Citizen.
-- Writes **exactly one** output file: `starloot-sync.json` (or whatever `--out`
-  path you give it), right next to wherever you ran it from.
+- Writes its output file: `starloot-sync.json` (or whatever `--out` path you
+  give it), right next to wherever you ran it from — plus, **only if it
+  crashes**, a `starloot-companion-error.log` next to it too, so errors are
+  never silently lost. See Troubleshooting below.
 - **No network connections**, ever — this is enforced by the code only using
   `node:fs`, `node:path`, `node:crypto`, `node:url`, and `node:readline`, no
   networking module is imported at all.
@@ -122,6 +124,21 @@ honest and checkable:
   — StarLoot's import only offers items sitting in `Container`/`Location`
   inventory refs, not things you're currently wearing or holding.
 
+## Troubleshooting / it crashed
+
+- **Check for `starloot-companion-error.log`** next to wherever you ran the
+  tool (same folder as `starloot-sync.json` would have been written). If the
+  script crashes, it appends a diagnostic block there — timestamp, script
+  version, Node/platform version, and the full stack trace — instead of
+  losing the error. Include that file's contents if you report a problem.
+- **Run it from a terminal** to see errors that happen *before* the script
+  even starts (e.g. a corrupted or incomplete `.exe` download) — double-click
+  launches can close the window too fast to read those. On Windows: open
+  File Explorer, click the address bar, type `cmd`, press Enter, then run the
+  exe by name (or drag it into the terminal window and press Enter).
+- **Try `--verbose`** for more detail while it runs (per-file line/event
+  counts) — the same detail is included in the error log if it then crashes.
+
 ## Requirements
 
 - Node.js **18 or later**. No `npm install` needed — this is a single file,
@@ -185,6 +202,7 @@ node starloot-companion.mjs --self-test
 | `--since <ISO date>` | Ignore any log line before this timestamp. |
 | `--ini <path>` | Path to `Data/Localization/english/global.ini` for real item display names. |
 | `--self-test` | Run the built-in self-test against the bundled fixture and exit. |
+| `--verbose` | Print per-file progress (lines/events parsed, per-category counts) as it runs. |
 | `--help` | Show usage. |
 
 ## Finding your `Game.log`
@@ -233,6 +251,7 @@ underscores, title-casing, and dropping trailing numeric/size tokens).
 ```json
 {
   "format": "starloot-sync/1",
+  "companionVersion": "0.1.1",
   "generatedAt": "2026-08-06T09:00:00.000Z",
   "player": "Morrschyvens",
   "gameVersion": "4.9.188.23497",

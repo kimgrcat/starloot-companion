@@ -68,7 +68,7 @@
  *        Executable: <path>
  */
 
-import { readFileSync, existsSync, readdirSync, writeFileSync, renameSync, statSync } from 'node:fs';
+import { readFileSync, existsSync, readdirSync, writeFileSync, appendFileSync, renameSync, statSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { join, basename, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -81,6 +81,78 @@ import { createInterface } from 'node:readline';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 const FORMAT = 'starloot-sync/1';
+const COMPANION_VERSION = '0.1.1';
+
+// ---------------------------------------------------------------------------
+// Crash diagnostics
+// ---------------------------------------------------------------------------
+
+/** Path the crash log is written to — always alongside the current working directory. */
+const ERROR_LOG_PATH = join(process.cwd(), 'starloot-companion-error.log');
+
+/** true once --verbose is parsed off argv; read by verboseLog() below. */
+let verboseEnabled = false;
+
+/** Print a line only when --verbose is set. */
+function verboseLog(msg) {
+	if (verboseEnabled) console.log(msg);
+}
+
+/**
+ * Append a diagnostic block to starloot-companion-error.log next to the CWD.
+ * Never throws — a failure while trying to log a crash must not mask the
+ * original crash or crash the crash handler itself.
+ */
+function appendErrorLog(err, context) {
+	try {
+		const stack = err instanceof Error ? (err.stack ?? String(err)) : String(err);
+		const lines = [
+			'-----------------------------------------------------------------',
+			`Time:                ${new Date().toISOString()}`,
+			`Companion version:   ${COMPANION_VERSION}`,
+			`Node version:        ${process.version}`,
+			`Platform:            ${process.platform} (${process.arch})`,
+			`Context:             ${context}`,
+			`Verbose mode:        ${verboseEnabled}`,
+			'',
+			stack,
+			'-----------------------------------------------------------------',
+			''
+		];
+		appendFileSync(ERROR_LOG_PATH, lines.join('\n') + '\n');
+	} catch {
+		// Best-effort only — nothing more we can do if even this fails.
+	}
+}
+
+/**
+ * Install global crash handlers. On an uncaught exception or unhandled
+ * rejection: log the diagnostic block, print a short friendly pointer to the
+ * log file, then either wait for Enter (interactive mode, so a double-clicked
+ * console window doesn't vanish) or exit(1) immediately (flag-driven mode —
+ * scripts/CI should never block on stdin).
+ */
+function installCrashHandlers(isInteractive) {
+	async function handle(err, kind) {
+		appendErrorLog(err, kind);
+		console.error(`\nSomething went wrong and StarLoot Companion crashed (${kind}).`);
+		console.error(`Details were saved to: ${ERROR_LOG_PATH}`);
+		console.error('Please include that file if you report this.');
+		if (isInteractive) {
+			await waitForEnterToExit();
+			process.exit(1);
+		} else {
+			process.exit(1);
+		}
+	}
+
+	process.on('uncaughtException', (err) => {
+		handle(err, 'uncaughtException');
+	});
+	process.on('unhandledRejection', (reason) => {
+		handle(reason instanceof Error ? reason : new Error(String(reason)), 'unhandledRejection');
+	});
+}
 
 // ---------------------------------------------------------------------------
 // Well-known Game.log install locations (double-click / no-args mode only)
@@ -167,6 +239,7 @@ function parseArgs(argv) {
 		else if (a === '--since') args.since = argv[++i];
 		else if (a === '--ini') args.ini = argv[++i];
 		else if (a === '--self-test') args.selfTest = true;
+		else if (a === '--verbose') args.verbose = true;
 		else if (a === '--help' || a === '-h') args.help = true;
 	}
 	return args;
@@ -187,6 +260,9 @@ Options:
   --since <ISO date> Ignore log lines before this timestamp
   --ini <path>       Path to Data/Localization/english/global.ini for display names
   --self-test        Parse the bundled fixture lines and assert expected counts
+  --verbose          Print per-file progress (lines/events parsed) as it runs;
+                      the same detail is included in starloot-companion-error.log
+                      if a crash happens
   --help             Show this help
 
 See README.md for how to find your Game.log and global.ini.
@@ -660,8 +736,12 @@ function parseFiles(filePaths, sinceIso) {
 	const since = sinceIso ? new Date(sinceIso).toISOString() : null;
 
 	for (const filePath of filePaths) {
+		verboseLog(`[verbose] Parsing file: ${filePath}`);
 		const lines = readLogFile(filePath);
 		let sawSessionStart = false;
+		const eventsBefore = events.length;
+		// per-category event counts for this file, for --verbose progress output
+		const categoryCounts = {};
 		for (const line of lines) {
 			const ev = parseLine(line);
 			if (!ev) continue;
@@ -671,11 +751,20 @@ function parseFiles(filePaths, sinceIso) {
 				sawSessionStart = true;
 				continue;
 			}
+			categoryCounts[ev.type] = (categoryCounts[ev.type] ?? 0) + 1;
 			events.push(ev);
 		}
 		if (!sawSessionStart && events.length) {
 			// No explicit header found (e.g. a fixture snippet) — still record the file.
 			sessionsSeen.push({ start: events[0]?.timestamp ?? null, file: basename(filePath) });
+		}
+		if (verboseEnabled) {
+			const eventsParsed = events.length - eventsBefore;
+			verboseLog(`[verbose]   lines: ${lines.length}, events: ${eventsParsed}`);
+			const categorySummary = Object.entries(categoryCounts)
+				.map(([type, count]) => `${type}=${count}`)
+				.join(', ');
+			verboseLog(`[verbose]   by category: ${categorySummary || '(none)'}`);
 		}
 	}
 
@@ -707,6 +796,7 @@ function buildSyncFile({ log, backups, ini, since }) {
 
 	return {
 		format: FORMAT,
+		companionVersion: COMPANION_VERSION,
 		generatedAt: new Date().toISOString(),
 		player: ledger.player ?? null,
 		gameVersion: ledger.gameVersion ?? null,
@@ -782,6 +872,7 @@ async function runInteractiveMode() {
 	// prints one friendly line and still waits for Enter.
 	try {
 		console.log('StarLoot Companion\n');
+		if (verboseEnabled) console.log(`Version: ${COMPANION_VERSION}\n`);
 
 		let log = autoLocateGameLog();
 		if (log) {
@@ -818,8 +909,10 @@ async function runInteractiveMode() {
 		console.log(`  locations: ${locations.size}`);
 		console.log(`\nUpload ${basename(writtenPath)} into StarLoot's personal dashboard (Import) to continue.`);
 	} catch (err) {
+		appendErrorLog(err, 'runInteractiveMode');
 		console.error(`\nSomething went wrong: ${err instanceof Error ? err.message : String(err)}`);
 		console.error('No output file was written. Nothing on your system was changed.');
+		console.error(`Details were saved to: ${ERROR_LOG_PATH}`);
 		process.exitCode = 1;
 	} finally {
 		await waitForEnterToExit();
@@ -852,6 +945,13 @@ function runFlagDrivenMode(args) {
 async function main() {
 	const rawArgs = process.argv.slice(2);
 	const args = parseArgs(rawArgs);
+	verboseEnabled = !!args.verbose;
+
+	// No flags at all (double-click / bare `node starloot-companion.mjs`) counts
+	// as interactive; every other invocation (including --self-test, used by
+	// CI) is flag-driven and must never block on stdin when it crashes.
+	const isInteractive = rawArgs.length === 0;
+	installCrashHandlers(isInteractive);
 
 	if (args.help) {
 		printHelp();
@@ -863,13 +963,12 @@ async function main() {
 		return;
 	}
 
-	// No flags at all (double-click / bare `node starloot-companion.mjs`) — go
-	// interactive instead of erroring out with a --help dump.
-	if (rawArgs.length === 0) {
+	if (isInteractive) {
 		await runInteractiveMode();
 		return;
 	}
 
+	if (verboseEnabled) console.log(`StarLoot Companion v${COMPANION_VERSION}`);
 	runFlagDrivenMode(args);
 }
 
