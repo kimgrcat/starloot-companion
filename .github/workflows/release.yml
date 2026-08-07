@@ -1,0 +1,113 @@
+name: Release
+
+# Builds starloot-companion.exe from the tagged source and publishes a GitHub
+# Release with the exe, the plain script, and sha256 checksums.
+#
+# Transparency: the exe is only ever built here, in public CI, from the tagged
+# source anyone can read — never on a developer machine.
+#
+# The SEA blob is platform-independent (useSnapshot/useCodeCache OFF), so we
+# build it on this Linux runner and inject it into the official Windows
+# node.exe — the documented cross-injection pattern. Since the Windows exe
+# can't be executed here, the SAME blob is injected into the runner's own
+# Linux node binary and smoke-tested; a broken blob fails the release loudly.
+#
+# CRITICAL: the Windows node.exe version MUST exactly match the Node that
+# built the blob — SEA blobs are not portable across Node versions, and a
+# mismatch produces an exe that fails instantly on Windows while remaining
+# invisible to the Linux smoke test (which always matches itself). The
+# version is therefore derived from `node --version`, making a mismatch
+# impossible by construction.
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install osslsigncode (for signature stripping)
+        run: sudo apt-get update && sudo apt-get install -y osslsigncode
+
+      - name: Self-test
+        run: node starloot-companion.mjs --self-test
+
+      - name: Build SEA blob (includes static safety-invariant checks)
+        run: node build-exe.mjs
+
+      - name: Smoke-test blob on Linux (fail loudly if broken)
+        run: |
+          set -e
+          cp "$(command -v node)" dist/starloot-companion-linux
+          npx postject dist/starloot-companion-linux NODE_SEA_BLOB dist/sea-prep.blob \
+            --sentinel-fuse NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2
+          chmod +x dist/starloot-companion-linux
+          ./dist/starloot-companion-linux --self-test
+
+      - name: Download Windows node.exe (exact version that built the blob)
+        run: |
+          set -e
+          NODE_WIN_VERSION="$(node --version)"
+          echo "Blob built by Node ${NODE_WIN_VERSION}; downloading matching win-x64 binary"
+          curl -fsSL -o node-win.zip "https://nodejs.org/dist/${NODE_WIN_VERSION}/node-${NODE_WIN_VERSION}-win-x64.zip"
+          unzip -q node-win.zip
+          cp "node-${NODE_WIN_VERSION}-win-x64/node.exe" dist/node-win.exe
+
+      - name: Strip Authenticode signature from node.exe
+        # The official node.exe is signed by the Node.js Foundation; injection
+        # would invalidate that signature, and a BROKEN signature reads worse
+        # to AV/SmartScreen than none ("tampered signed binary"). Strip first
+        # so the shipped exe is cleanly unsigned.
+        run: |
+          set -e
+          osslsigncode remove-signature -in dist/node-win.exe -out dist/starloot-companion.exe
+
+      - name: Inject SEA blob into starloot-companion.exe
+        run: |
+          set -e
+          npx postject dist/starloot-companion.exe NODE_SEA_BLOB dist/sea-prep.blob \
+            --sentinel-fuse NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2
+
+      - name: Verify exe is cleanly unsigned
+        run: |
+          set -e
+          if osslsigncode verify dist/starloot-companion.exe 2>&1 | grep -qi "No signature found"; then
+            echo "starloot-companion.exe is cleanly unsigned, as expected."
+          else
+            echo "ERROR: exe is not cleanly unsigned (broken/partial signature)." >&2
+            osslsigncode verify dist/starloot-companion.exe || true
+            exit 1
+          fi
+
+      - name: Assemble release assets + checksums
+        run: |
+          set -e
+          mkdir -p release
+          cp dist/starloot-companion.exe release/
+          cp starloot-companion.mjs release/
+          cd release
+          sha256sum starloot-companion.exe starloot-companion.mjs > checksums.txt
+          cat checksums.txt
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          gh release create "${GITHUB_REF_NAME}" \
+            release/starloot-companion.exe \
+            release/starloot-companion.mjs \
+            release/checksums.txt \
+            --title "StarLoot Companion ${GITHUB_REF_NAME}" \
+            --generate-notes \
+            --verify-tag

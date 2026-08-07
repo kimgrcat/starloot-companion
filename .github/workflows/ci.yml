@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Self-test (parser against bundled fixtures)
+        run: node starloot-companion.mjs --self-test
+
+      - name: Build SEA blob (includes static safety-invariant checks)
+        run: node build-exe.mjs
+
+      - name: Smoke-test blob on Linux
+        run: |
+          set -e
+          cp "$(command -v node)" dist/starloot-companion-linux
+          npx postject dist/starloot-companion-linux NODE_SEA_BLOB dist/sea-prep.blob \
+            --sentinel-fuse NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2
+          chmod +x dist/starloot-companion-linux
+          ./dist/starloot-companion-linux --self-test
