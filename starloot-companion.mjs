@@ -39,6 +39,29 @@
  *      Store/Queued lines below, but UNTESTED ON REAL DATA — flagged here
  *      and in the README.
  *
+ *   2b. Bulk multi-select Move — a real capture: multi-selecting several
+ *       items in the inventory UI and moving them into an opened container
+ *       (a pirate/Stor-All box, a ship locker, etc.) logs ONE line carrying
+ *       ALL of their identities together:
+ *         <Add Inventory Management Move> New request[N] Player[<name>]
+ *           Type[Move] SourceInventory[REF] TargetInventory[REF]
+ *           ItemClass[[<class>] [<class>] ... ] StoredEntity[NULL] ...
+ *       Repeats in the bracketed list mean multiple units of that class
+ *       moved together (count occurrences = quantity). Identity lives ONLY
+ *       on this Add line — the paired
+ *         <InventoryManagementRequest> Queued Request[N] Type[Move] ...
+ *       line carries Item[NONE]/Source[NULL]/Target[NULL] for this event
+ *       shape, so unlike single-item Store/Move we correlate on the Add
+ *       line alone rather than waiting for a Queued Item[<class>_<id>]
+ *       token. We still only count it "landed" once the matching
+ *         <Player Inventory Request Complete> Request[N] ... Result[Succeed]
+ *       arrives, same as every other request type here.
+ *       NOTE: `<Add Inventory Management Move>` lines also fire for
+ *       Type[QueryInventory]/Type[Sort]/Type[OpenNestedInventory] with an
+ *       empty or `[none]` ItemClass — we only ever parse Type[Move] (and
+ *       Type[Store], if SC ever emits one that way) with a non-empty
+ *       bracketed class list.
+ *
  *   3. Equip / take out of a container:
  *        <EquipItem> Request[N] equip from Inventory[REF] Class[<class>] ...
  *      The item class LEAVES that inventory (net effect: -1 there).
@@ -81,7 +104,7 @@ import { createInterface } from 'node:readline';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 const FORMAT = 'starloot-sync/1';
-const COMPANION_VERSION = '0.1.3';
+const COMPANION_VERSION = '0.1.4';
 
 // ---------------------------------------------------------------------------
 // Crash diagnostics
@@ -303,12 +326,45 @@ function parseLine(raw) {
 		return { type: 'sessionStart', timestamp, raw };
 	}
 
+	// --- Bulk multi-select Move/Store (identity lives ONLY on this line) --------
+	// e.g. <Add Inventory Management Move> New request[48] Player[Morrschyvens]
+	//        Type[Move] SourceInventory[204698936815:Location:810966700]
+	//        TargetInventory[718156344427:Container:0]
+	//        ItemClass[[POWR_JUST_S01_Fortitude_SCItem] [POWR_JUST_S01_Fortitude_SCItem]
+	//          [POWR_AMRS_S01_DynaFlux_SCItem] ... ] StoredEntity[NULL] ...
+	// Also fires (harmlessly, and must be ignored) for Type[QueryInventory],
+	// Type[Sort], Type[OpenNestedInventory] etc. with ItemClass[] or
+	// ItemClass[none] — only a non-empty bracketed list under Type[Move] or
+	// Type[Store] is a real bulk transfer.
+	let mm = /^<Add Inventory Management Move> New request\[(\d+)\] Player\[([^\]]+)\] Type\[(Move|Store)\] SourceInventory\[([^\]]+)\] TargetInventory\[([^\]]+)\] ItemClass\[(.*?)\] StoredEntity\[/.exec(rest);
+	if (mm) {
+		const [, requestId, player, moveType, sourceRef, targetRef, classListRaw] = mm;
+		const classTokens = [...classListRaw.matchAll(/\[([^\]]+)\]/g)].map((t) => t[1].trim()).filter(Boolean);
+		if (classTokens.length === 0) return null; // QueryInventory/Sort/etc. — nothing to parse
+		// Strip a trailing `_SCItem` suffix for ledger/display purposes; keep the
+		// stripped form as the canonical class (downstream matching is
+		// case-insensitive, so this doesn't lose any matchability).
+		const classes = classTokens.map((c) => c.replace(/_SCItem$/i, ''));
+		// Count occurrences per class — repeats in the bracketed list are the
+		// per-class quantity moved together.
+		const counts = new Map();
+		for (const cls of classes) counts.set(cls, (counts.get(cls) ?? 0) + 1);
+		return {
+			type: 'bulkMove',
+			timestamp, raw,
+			requestId, moveType, player,
+			sourceRef: sourceRef === 'INVALID' ? null : sourceRef,
+			targetRef: targetRef === 'INVALID' ? null : targetRef,
+			classCounts: [...counts.entries()].map(([itemClass, quantity]) => ({ itemClass, quantity }))
+		};
+	}
+
 	// --- Queued Store/Move requests ---------------------------------------------
 	// e.g. Queued Request[28528] Type[Store] for 'Morrschyvens' [204698936815]
 	//        Source Inventory[INVALID] Target Inventory[718156344314:Container:0].
 	//        Source[NULL] amount[0] rank[]. Target[NULL] amount[0] rank[].
 	//        Item[grin_multitool_01_tractorbeam_350026627816] action[None]. ...
-	let mm = /^<InventoryManagementRequest> Queued Request\[(\d+)\] Type\[(Store|Move)\] for '([^']+)'.*?Source Inventory\[([^\]]+)\] Target Inventory\[([^\]]+)\]\..*?Item\[([^\]]+)\]/.exec(rest);
+	mm = /^<InventoryManagementRequest> Queued Request\[(\d+)\] Type\[(Store|Move)\] for '([^']+)'.*?Source Inventory\[([^\]]+)\] Target Inventory\[([^\]]+)\]\..*?Item\[([^\]]+)\]/.exec(rest);
 	if (mm) {
 		const [, requestId, moveType, player, sourceRef, targetRef, itemToken] = mm;
 		if (itemToken === 'NONE') return null;
@@ -486,11 +542,33 @@ function reduceLedger(events) {
 				pendingByRequest.set(ev.requestId, ev);
 				break;
 
+			case 'bulkMove':
+				// Identity lives ONLY on this Add line for this event shape — the
+				// paired Queued line carries Item[NONE]/Source[NULL]/Target[NULL],
+				// so we correlate on the Add line alone (keyed by requestId) rather
+				// than waiting for a Queued Item[<class>_<id>] token.
+				player = player ?? ev.player;
+				if (ev.targetRef) containerLocation.set(ev.targetRef, currentLocation ?? containerLocation.get(ev.targetRef) ?? null);
+				if (ev.sourceRef) containerLocation.set(ev.sourceRef, currentLocation ?? containerLocation.get(ev.sourceRef) ?? null);
+				pendingByRequest.set(ev.requestId, ev);
+				break;
+
 			case 'requestComplete': {
 				const pend = pendingByRequest.get(ev.requestId);
 				if (!pend) break;
 				pendingByRequest.delete(ev.requestId);
 				if (ev.result !== 'Succeed') break; // failed request never landed
+
+				if (pend.type === 'bulkMove') {
+					// No per-entity ids available on this event shape (StoredEntity[NULL]
+					// on the Add line) — apply naive per-class deltas using the counted
+					// occurrences from the bracketed ItemClass list.
+					for (const { itemClass, quantity } of pend.classCounts) {
+						if (pend.targetRef) touch(itemClass, pend.targetRef, quantity, ev.timestamp, ev.requestId, pend.raw);
+						if (pend.sourceRef) touch(itemClass, pend.sourceRef, -quantity, ev.timestamp, ev.requestId, pend.raw);
+					}
+					break;
+				}
 
 				// Prefer the entity id straight off the queued Item[<class>_<id>] token;
 				// fall back to the completion line's trailing Item[<id>] field.
@@ -879,6 +957,19 @@ async function runSelfTest() {
 	assert(tractorBeam && tractorBeam.quantity === 1, `expected tractor-beam quantity 1, got ${tractorBeam?.quantity}`);
 
 	assert(ledger.eventHashes.length > 0, 'expected at least one contributing event hash');
+
+	// Bulk multi-select Move (request 48, real capture): 6 power plant units
+	// across 4 distinct classes landing in container 718156344427:Container:0.
+	const bulkContainerRef = '718156344427:Container:0';
+	const bulkItems = ledger.items.filter((i) => i.containerRef === bulkContainerRef);
+	const bulkByClass = new Map(bulkItems.map((i) => [i.class, i.quantity]));
+	assert(bulkItems.length === 4, `expected 4 distinct power plant classes in ${bulkContainerRef}, got ${bulkItems.length}`);
+	assert(bulkByClass.get('POWR_JUST_S01_Fortitude') === 2, `expected 2x POWR_JUST_S01_Fortitude, got ${bulkByClass.get('POWR_JUST_S01_Fortitude')}`);
+	assert(bulkByClass.get('POWR_AMRS_S01_DynaFlux') === 1, `expected 1x POWR_AMRS_S01_DynaFlux, got ${bulkByClass.get('POWR_AMRS_S01_DynaFlux')}`);
+	assert(bulkByClass.get('POWR_AEGS_S01_Regulus') === 2, `expected 2x POWR_AEGS_S01_Regulus, got ${bulkByClass.get('POWR_AEGS_S01_Regulus')}`);
+	assert(bulkByClass.get('POWR_LPLT_S01_PowerBolt') === 1, `expected 1x POWR_LPLT_S01_PowerBolt, got ${bulkByClass.get('POWR_LPLT_S01_PowerBolt')}`);
+	const bulkTotalUnits = bulkItems.reduce((sum, i) => sum + i.quantity, 0);
+	assert(bulkTotalUnits === 6, `expected 6 total power plant units in ${bulkContainerRef}, got ${bulkTotalUnits}`);
 
 	const persistentAttachments = ledger.items.filter((i) => i.containerRef.includes(':Worn:'));
 	assert(persistentAttachments.length > 0, 'expected at least one persistent loadout attachment in the fixture');

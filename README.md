@@ -106,10 +106,17 @@ honest and checkable:
   `Store`) is implemented from the same log grammar as `Store`, but it was
   never observed in the real session used to build/verify this script.**
   Treat it as best-effort/untested until someone captures a real example.
-- **Bulk multi-item moves** (a single request moving several item classes at
-  once) were not observed either. If SC's log ever emits one, today's parser
-  will simply not recognise that specific line and will skip it — it won't
-  corrupt your ledger, it'll just miss that move.
+- **Bulk multi-item moves are supported, but only when captured a specific
+  way.** The confirmed capture recipe: multi-select items in the inventory UI
+  and move them into an opened container (a pirate/Stor-All box, a ship
+  locker, etc.) — this logs full item identities on one
+  `<Add Inventory Management Move> ... Type[Move] ... ItemClass[[...] [...] ...]`
+  line, which the parser reads directly (repeats in the bracketed list count
+  as quantity per class). Single-item drags, freight elevators, and
+  tractor-beam handling do **not** log this way and are not covered by this
+  path — those either fall through to the regular Store/Move handling above
+  (if there's a matching `Queued`/`Item[<class>_<id>]` line) or aren't
+  captured at all.
 - **Location codes are internal game codes** (e.g. `RR_ARC_LEO`), not always
   human-friendly names. StarLoot's import step will do its best to prettify
   them, but you may see the raw code if we don't recognise it.
