@@ -81,7 +81,7 @@ import { createInterface } from 'node:readline';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 const FORMAT = 'starloot-sync/1';
-const COMPANION_VERSION = '0.1.2';
+const COMPANION_VERSION = '0.1.3';
 
 // ---------------------------------------------------------------------------
 // Crash diagnostics

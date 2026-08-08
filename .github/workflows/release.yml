@@ -72,6 +72,28 @@ jobs:
           set -e
           osslsigncode remove-signature -in dist/node-win.exe -out dist/starloot-companion.exe
 
+      - name: Apply icon + version metadata
+        # MUST run after stripping the signature and before injecting the SEA
+        # blob: editing the .rsrc section after postject injection could
+        # corrupt the injected blob. resedit-cli is pure JS (no native deps),
+        # so it works fine on this Linux runner even though the target is a
+        # Windows PE.
+        run: |
+          set -e
+          VERSION="${GITHUB_REF_NAME#v}"
+          # resedit requires n.n.n.n; pad our x.y.z semver tag with a 4th 0.
+          FILE_VERSION="${VERSION}.0"
+          echo "Applying icon.ico and version ${FILE_VERSION} to starloot-companion.exe"
+          npx --yes resedit-cli \
+            --in dist/starloot-companion.exe \
+            --out dist/starloot-companion.exe \
+            --icon 1,icon.ico \
+            --product-name "StarLoot Companion" \
+            --file-description "StarLoot Companion — Star Citizen Game.log to sync file" \
+            --company-name "StarLoot" \
+            --file-version "${FILE_VERSION}" \
+            --product-version "${FILE_VERSION}"
+
       - name: Inject SEA blob into starloot-companion.exe
         run: |
           set -e
